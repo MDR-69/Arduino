@@ -35,8 +35,8 @@ const int ledPin = 13;
 #define BAUD_RATE 115200               // USB Serial Baud rate - has no impact, Teensy always work at 12 Mbps
 
 #define HWSERIAL               Serial1 // UART serial used to receive data forwarded by the RF microcontroller
-#define HWSERIAL_BAUDRATE      600000  // UART Serial Baud rate - equal to 96MHz/(10*16)
-#define RX_COM_REINIT_TIMEOUT  20000   // If no frame is received after 20 seconds, consider the RF communication link to be down
+#define HWSERIAL_BAUDRATE      6000000 // UART Serial baudrate - equal to 96MHz/16, absolute maximum available with Teensy 3.2
+#define RX_COM_REINIT_TIMEOUT  30000   // If no frame is received after 20 seconds, consider the RF communication link to be down
 
 //define some tpm constants
 #define TPM2NET_HEADER_SIZE 4

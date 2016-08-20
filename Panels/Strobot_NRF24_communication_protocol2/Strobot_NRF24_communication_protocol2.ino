@@ -57,6 +57,7 @@
 #define NB_FRAMES              int(ceil(NB_LEDS*BYTES_PER_PIXEL/(USEFUL_PAYLOAD_SIZE)))
 #define NB_PIXELS_PER_FRAME    int(USEFUL_PAYLOAD_SIZE/BYTES_PER_PIXEL)
 
+
 /*************  Hardware Definitions - TX side only  ************/
 #define TX_COM_REINIT_TIMEOUT  20000   // If no frame is received after 20 seconds, consider the communication link to be down
 
