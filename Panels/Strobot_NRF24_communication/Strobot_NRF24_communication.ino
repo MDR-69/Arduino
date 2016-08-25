@@ -34,10 +34,10 @@
 #include <SPI.h>
 #include "RF24.h"
 
-#define DEBUG                  1
+//#define DEBUG                  1
 
 /*************  Hardware Definitions *******************************/
-#define ID                     0        // Define the ID of the panel to communicate with, range is [0,4]
+#define ID                     4        // Define the ID of the panel to communicate with, range is [0,4]
 /*
 #define ID                     1
 #define ID                     2
@@ -51,25 +51,34 @@
 /*************  Hardware Definitions - General  *****************/
 #define NB_LEDS                128
 #define BYTES_PER_PIXEL        3
-#define USEFUL_PAYLOAD_SIZE    9    // Each packet contains the data for a few leds LEDs, and a header      
-#define RF_FRAME_SIZE          10    // 32 is the hardware limitation of RF24 modules, but data transmission is more reliable with smaller packets
+#define USEFUL_PAYLOAD_SIZE    9       // Each packet contains the data for a few leds LEDs, and a header      
+#define RF_FRAME_SIZE          10      // 32 is the hardware limitation of RF24 modules, but data transmission is more reliable with smaller packets
+#define DATA_BUFFER_SIZE       NB_LEDS*BYTES_PER_PIXEL
 #define HEADER_SIZE            RF_FRAME_SIZE - USEFUL_PAYLOAD_SIZE
-#define NB_FRAMES              int(ceil(NB_LEDS*BYTES_PER_PIXEL/(USEFUL_PAYLOAD_SIZE)))
+#define NB_FRAMES              int(ceil(NB_LEDS*BYTES_PER_PIXEL/(USEFUL_PAYLOAD_SIZE + 0.0)))
 #define NB_PIXELS_PER_FRAME    int(USEFUL_PAYLOAD_SIZE/BYTES_PER_PIXEL)
-//#define FRAMESIZE_IN_HEADER    1
+//#define FRAMESIZE_IN_HEADER  1       // Best not to include the frame size in the header, as it allows to shave off 2 bytes from the packet
 #define SHORT_RF_ADDRESS       1       // Use 24 bit addresses instead of 40 bit ones
-#define ENABLE_CRC             1
+#define ENABLE_CRC             1       // Use 8 bit CRC for performance. Not much is gained from setting it off, and it prevents from receiving gibberish
 
 /*************  Hardware Definitions - TX side only  ************/
 #define TX_COM_REINIT_TIMEOUT  20000   // If no frame is received after 20 seconds, consider the communication link to be down
 
 /*************  Hardware Definitions - RX side only  ************/
-#define NB_FRAMES_TX_PER_SEC   60      // Only used on the RX side: number of frames the receiver shall send to the LED microcontroller per second
+#define NB_FRAMES_TX_PER_SEC   100      // Only used on the RX side: number of frames the receiver shall send to the LED microcontroller per second
 #define RX_FRAME_TX_PERIOD_MS  int(1000/NB_FRAMES_TX_PER_SEC)
 #define HWSERIAL               Serial1 // UART serial used to forward data to the LED microcontroller
 #define HWSERIAL_BAUDRATE      6000000 // UART Serial baudrate - equal to 96MHz/16, absolute maximum available with Teensy 3.2
 #define RX_COM_REINIT_TIMEOUT  20000   // If no frame is received after 20 seconds, consider the communication link to be down
 
+//#define OPTIMIZE_LED_FRAME_TX  1     // When a frame must be transmitted to the LED microcontroller, send it using non-blocking Serial write calls
+                                       // -- This is actually not necessary, another way around the problem exists:
+                                       // Teensy's Serial1 RX/TX buffer sizes can be modified
+                                       // In /Applications/Arduino.app/Contents/Java/hardware/teensy/avr/cores/teensy3, change in the file serial1.c :
+                                       // #define TX_BUFFER_SIZE     64 // number of outgoing bytes to buffer     ---> Change to 512
+                                       // #define RX_BUFFER_SIZE     64 // number of incoming bytes to buffer     ---> Change to 512
+                                       // With the buffers this big, the HWSERIAL.write call becomes non-blocking, and returns after 140 microsecs (instead of 580)
+                                       
 /*************  TPM2 Definitions *******************************/
 #define TPM2NET_HEADER_SIZE 4
 #define TPM2NET_HEADER_IDENT 0x9c
@@ -78,6 +87,8 @@
 #define TPM2NET_CMD_ANSWER 0xaa
 #define TPM2NET_FOOTER_IDENT 0x36
 #define SERIAL_FOOTER_SIZE 1
+
+#define SPECIAL_FULLFRAME_OFFSET 0xFF  // Special case: if the received frame is entirely of the same color, only one packet is enough to tell this to the RX
 
 //package size we expect
 #define MAX_PACKET_SIZE 520
@@ -94,13 +105,16 @@ uint8_t totalPacket;
 uint8_t packetNb = 0;                   // Current packet to be sent (subset of LED sent)
 
 /*************  RX side data information  *********************/
-uint8_t frameSize_msb;
-uint8_t frameSize_lsb;
-uint16_t frameSize = 0x0000;
+uint8_t frameSize_msb;                  // Not used with the current protocol
+uint8_t frameSize_lsb;                  // There isn't enough space in the header to put in the frame size
+uint16_t frameSize = 0x0000;            // These three variables are only used if FRAMESIZE_IN_HEADER is defined
 const uint8_t rx_packetnumber = 0;      // Todo: implement multi-packet transmission
-const uint8_t rx_totalpackets = 1;
+const uint8_t rx_totalpackets = 1;      // Note: given the current performance, it doesn't seem too possible to deal with 170+ LED arrays
 const uint8_t predefined_frameSize_msb = (uint8_t) ((NB_LEDS * BYTES_PER_PIXEL) >> 8);
 const uint8_t predefined_frameSize_lsb = (uint8_t) ((NB_LEDS * BYTES_PER_PIXEL) & 0xFF);
+bool transmit_to_led_teensy = false;    // When the flag is set to true, send a consolidated frame to the next Teensy
+uint16_t serialBuffer_write_offset;     // What byte should we be writing next ?
+bool special_uniform_frame = false;     // Is the frame entirely of the same color ?
 
 /*************  Hardware RF Configuration  *********************/
 RF24 radio(7,8);                        // Set up nRF24L01 radio on SPI bus plus pins 7 & 8
@@ -209,10 +223,10 @@ void setup(void) {
   // Initialize the TX data buffers
   for (int i=0; i<NB_FRAMES; i++) {
     memset(tx_data[i], 0, RF_FRAME_SIZE);    // Fill all RF_FRAME_SIZE bytes of tx_data[i] with 0's
-    tx_data[i][0] = i*NB_PIXELS_PER_FRAME;   // And put in the the LED offset
+    tx_data[i][0] = i*NB_PIXELS_PER_FRAME;   // And put in the LED offset
   }
   memset(temp_rx_data, 0, RF_FRAME_SIZE);    // Do the same for the temp RX buffer
-  
+  serialBuffer_write_offset = -1;
   
   radio.powerUp();                           // Power up the radio
 
@@ -231,7 +245,9 @@ void loop(void){
       int16_t res = readCommand();             // Check if Strobot has sent new data
       if (res > 0) {
         update_tx_data_buffers();              // Fill in the TX data buffers - if no seqNum is included in the frame header, the update can be done here
-        //send_all_packets();                    // And now send all packets
+        //send_all_packets();                  // And now send all packets - not a good idea to do it here. If more frames comi in from Strobot than
+                                               // what can be transmitted through radio.write, the USB Serial buffers will get filled, and the Teensy will freeze
+        
         #ifdef DEBUG
           Serial.println("FINE");
           //Serial.print(psize, DEC);    
@@ -254,12 +270,13 @@ void loop(void){
 
     
     if (communication_init) {
-      //update_tx_data_buffers();              // Fill in the TX data buffers - if a seqNum is included in the frame, the update must be done here
+      //update_tx_data_buffers();              // Fill in the TX data buffers - if a seqNum is included in the frame, the update must be done here. It is not the case with the minimal header used here.
 
-      //send_all_packets();                    // And now send all packets
-      send_specific_packet();                  // Send one specific packet - sending all of them would freeze the Teensy, while new frames are still being received
+      //send_all_packets();                    // And now send all packets - don't, too much work at once: this takes a lot of time, and new frames are still
+      send_specific_packet();                  // coming in through the USB Serial link. With a higher framerate, the USB rx buffer would eventually get filled,
+                                               // and the Teensy would freeze. Instead, send one packet packet at a time, and check if a new frame was received
 
-      // Actually not that good of an idea regarding TX : always try to send data, you never know
+      // Actually not that good of an idea regarding TX : always try to send data, you never know !
       //if (millis() - tx_last_received_frame_timestamp > TX_COM_REINIT_TIMEOUT) {
       //  communication_init = false;
       //}
@@ -272,36 +289,56 @@ void loop(void){
 
   #ifdef ROLE_RX
     while(radio.available()){
-     long readTime = micros();
-     radio.read(&temp_rx_data,RF_FRAME_SIZE);
-     Serial.println(micros() - readTime);
-     communication_init = true;
+      long readTime = micros();
+      radio.read(&temp_rx_data,RF_FRAME_SIZE);
+      Serial.println(micros() - readTime);
+      communication_init = true;
      
-     // Check the contents of the received data and put it at the appropriate offset in the frame buffer
-     process_rx_data();
+      // Check the contents of the received data and put it at the appropriate offset in the frame buffer
+      process_rx_data();
      
-     #ifdef DEBUG
-       Serial.print("RX: ");
-       Serial.print(temp_rx_data[0], DEC);
-       Serial.print(" / ");
-       Serial.print(temp_rx_data[0 + HEADER_SIZE], DEC);
-       Serial.print(" / ");
-       Serial.print(temp_rx_data[1 + HEADER_SIZE], DEC);
-       Serial.print(" / ");
-       Serial.println(temp_rx_data[2 + HEADER_SIZE], DEC);
-     #endif
-     rx_last_received_frame_timestamp = millis();
+      #ifdef DEBUG
+        Serial.print("RX: ");
+        Serial.print(temp_rx_data[0], DEC);
+        Serial.print(" / ");
+        Serial.print(temp_rx_data[0 + HEADER_SIZE], DEC);
+        Serial.print(" / ");
+        Serial.print(temp_rx_data[1 + HEADER_SIZE], DEC);
+        Serial.print(" / ");
+        Serial.println(temp_rx_data[2 + HEADER_SIZE], DEC);
+      #endif
+      rx_last_received_frame_timestamp = millis();
     }
 
     // Send a consolidated TPM2 frame to the LED microcontroller every RX_FRAME_TX_PERIOD_MS milliseconds
+    // However, sending a full frame at once takes too much time - even with the baudrate set at 6000000, the
+    // absolute maximum, it takes about 583 microseconds. This isn't much, but a nRF packet may be received
+    // every 100 microseconds - and the FIFO buffer of the nRF24l01 module is only 3 frame long.
+    // Set a "get ready to send the frame" flag and use non-blocking serial calls
     if(millis() - rxTimer > RX_FRAME_TX_PERIOD_MS && communication_init) {
-      rxTimer = millis();
-      transmit_consolidated_frame();
-      #ifdef DEBUG
-        Serial.print("-> TX:");
-        Serial.println(packetBuffer[0]);
+      rxTimer = millis();                      // Update the reference TX time
+      #ifdef OPTIMIZE_LED_FRAME_TX
+        transmit_to_led_teensy = true;         // Set the TX flag to true
+        serialBuffer_write_offset = -1;
+      #else
+        transmit_consolidated_frame();         // Or in non-optimized mode, send everything at once
+        #ifdef DEBUG
+          Serial.print("-> TX:");
+          Serial.println(packetBuffer[0]);
+        #endif
       #endif
     }
+
+    #ifdef OPTIMIZE_LED_FRAME_TX
+    if (transmit_to_led_teensy) {
+      if (serialBuffer_write_offset == -1) {
+        transmit_consolidated_frame_header();
+      }
+      else {
+        transmit_consolidated_frame_body();
+      }
+    }
+    #endif
 
     if (millis() - rx_last_received_frame_timestamp > RX_COM_REINIT_TIMEOUT) {
       communication_init = false;
@@ -366,10 +403,47 @@ void update_tx_data_buffers() {
   for (int i=0; i<NB_FRAMES; i++) {
     memcpy(tx_data[i] + HEADER_SIZE, packetBuffer + i*USEFUL_PAYLOAD_SIZE, USEFUL_PAYLOAD_SIZE);
   }
+
+  // Check if the currently processed frame is uniform (all pixels are the same color)
+  bool sameColor   = true;
+  uint8_t redVal   = packetBuffer[0];
+  uint8_t greenVal = packetBuffer[1];
+  uint8_t blueVal  = packetBuffer[2];
+  for (int i=3; i<DATA_BUFFER_SIZE; i+=BYTES_PER_PIXEL) {
+    if (!(packetBuffer[i] == redVal && packetBuffer[i+1] == greenVal && packetBuffer[i+2] == blueVal)) {
+      sameColor = false;
+      break;
+    }
+  }
+  // If the current frame is uniform, a special offset will be used when sending the packets
+  special_uniform_frame = sameColor;
+  if (sameColor) {
+    special_uniform_frame = true;
+    for (int i=0; i<NB_FRAMES; i++) {
+      tx_data[i][0] = SPECIAL_FULLFRAME_OFFSET;   // Put in the special "full frame" LED offset
+    }
+  }
+  else {
+    special_uniform_frame = false;
+    for (int i=0; i<NB_FRAMES; i++) {
+      tx_data[i][0] = i*NB_PIXELS_PER_FRAME;      // Put in the regular LED offset
+    }    
+  }
+  
 }
 
 void process_rx_data() {
-  memcpy(packetBuffer + temp_rx_data[0]*BYTES_PER_PIXEL, temp_rx_data + HEADER_SIZE, USEFUL_PAYLOAD_SIZE);
+  uint8_t offset_val = temp_rx_data[0];
+  if (offset_val == SPECIAL_FULLFRAME_OFFSET) {
+    for (int i=0; i<DATA_BUFFER_SIZE; i+=3) {
+      packetBuffer[i]   = temp_rx_data[HEADER_SIZE];
+      packetBuffer[i+1] = temp_rx_data[HEADER_SIZE+1];
+      packetBuffer[i+2] = temp_rx_data[HEADER_SIZE+2];
+    }
+  }
+  else {
+    memcpy(packetBuffer + offset_val*BYTES_PER_PIXEL, temp_rx_data + HEADER_SIZE, USEFUL_PAYLOAD_SIZE);
+  }
   #ifdef FRAMESIZE_IN_HEADER
     frameSize_msb = temp_rx_data[1];      // Using smaller packets, no overhead left to send the frame side. And anyways, the size is always the same, set to BYTES_PER_PIXEL * NB_LEDS
     frameSize_lsb = temp_rx_data[2];
@@ -397,10 +471,10 @@ void send_all_packets() {
       //Serial.print(tx_data[i][0]);
     #endif
 
-    if(micros() - syncTime > 3500) {          // This is only required because NO ACK ( enableAutoAck(0) ) payloads are used
+    if(micros() - syncTime > 3700) {          // This is only required because NO ACK ( enableAutoAck(0) ) payloads are used
       syncTime = micros();                 // Need to drop out of TX mode every 4ms if sending a steady stream of multicast data
       radio.txStandBy();         // This gives the PLL time to sync back up
-      delayMicroseconds(130);
+      //delayMicroseconds(130);
       #ifdef DEBUG
         Serial.print("/");
         Serial.send_now();
@@ -431,9 +505,9 @@ void send_specific_packet() {
   #endif
   packetNb = (packetNb+1)%NB_FRAMES;                        // Increment for the next loop
   
-  if(micros() - syncTime > 3500) {          // This is only required because NO ACK ( enableAutoAck(0) ) payloads are used
+  if(micros() - syncTime > 3700) {       // This is only required because NO ACK ( enableAutoAck(0) ) payloads are used
       syncTime = millis();               // Need to drop out of TX mode every 4ms if sending a steady stream of multicast data
-      radio.txStandBy();                // This gives the PLL time to sync back up
+      radio.txStandBy();                 // This gives the PLL time to sync back up
       //delayMicroseconds(130);
       #ifdef DEBUG
         Serial.print("/");
@@ -491,3 +565,19 @@ void transmit_consolidated_frame() {
   
 }
 
+void transmit_consolidated_frame_header() {
+  HWSERIAL.write(TPM2NET_HEADER_IDENT);
+  HWSERIAL.write(TPM2NET_CMD_DATAFRAME);
+  HWSERIAL.write(predefined_frameSize_msb);  // Frame size MSB (1)   - not enough space left in the header to include the frame size
+  HWSERIAL.write(predefined_frameSize_lsb);  // Frame size LSB (128) - anyways, the size is always the same, as it is hardware-dependant
+  serialBuffer_write_offset = 0;
+}
+
+void transmit_consolidated_frame_body() {
+ uint8_t availableBytes = HWSERIAL.availableForWrite();
+}
+
+void transmit_consolidated_frame_footer() {
+  HWSERIAL.write(TPM2NET_FOOTER_IDENT);
+  transmit_to_led_teensy = false;
+}

@@ -1,6 +1,6 @@
 /*
  * Strobot - LED Panel Teensy firmware
- * To be used either with Teensy 3.0 or 3.1 microcontrollers
+ * To be used with Teensy 3.x microcontrollers
  * 
  * ------------------------------------------------------------------------
  *
@@ -16,7 +16,7 @@
 
 //---- START USER CONFIG ----
 
-#define DEBUG 1
+//#define DEBUG 1
 
 //how many led pixels are connected
 #define NUM_LEDS 128
@@ -55,8 +55,10 @@ const int ledPin = 13;
 
 #define PIXELS_PER_PACKET 170
 
+#define MIN_REFRESH_PERIOD 200         // Refresh the image on the LEDs at least once every n milliseconds
+
 // buffers for receiving and sending data
-uint8_t packetBuffer[MAX_PACKET_SIZE]; //buffer to hold incoming packet
+uint8_t packetBuffer[MAX_PACKET_SIZE]; // buffer to hold incoming packet
 uint16_t psize;
 uint8_t currentPacket;
 uint8_t totalPacket;
@@ -64,6 +66,7 @@ uint8_t totalPacket;
 uint8_t serialMode;
 
 unsigned long communicationTimeout_timer;
+unsigned long lastFrameDisplayed_timer;
 
 CRGB leds[NUM_LEDS];
 
@@ -78,18 +81,9 @@ void updatePixels() {
   uint16_t ofs=0;
   uint16_t ledOffset = PIXELS_PER_PACKET*currentPacket;
 
-  //Serial.print("Array:");
   for (uint16_t i=0; i<nrOfPixels; i++) {
-//    Serial.print("[");
-//    Serial.print(packetBuffer[ofs]);
-//    Serial.print(",");
-//    Serial.print(packetBuffer[ofs+1]);
-//    Serial.print(",");
-//    Serial.print(packetBuffer[ofs+2]);
-//    Serial.print("] / ");
     leds[i+ledOffset] = CRGB(packetBuffer[ofs++], packetBuffer[ofs++], packetBuffer[ofs++]);    
   }
-  //Serial.println("///");
   
   //update only if all data packets recieved
   if (currentPacket==totalPacket-1) {
@@ -98,6 +92,7 @@ void updatePixels() {
       Serial.send_now();
     #endif    
     FastLED.show();
+    lastFrameDisplayed_timer = millis();
   } else {
     #ifdef DEBUG      
       Serial.print("NOTUPDATE: ");
@@ -313,6 +308,7 @@ void setup() {
   showInitImage();      // display some colors
 
   communicationTimeout_timer = millis();   // This timer contains the timestamp of the last frame received through the USB serial link
+  lastFrameDisplayed_timer = millis();     // This timer allows to periodically redraw the image, even if no new image has arrived - this is useful to prevent the LEDs from glitching after an extended amount of time
 }
 
 //********************************
@@ -329,9 +325,11 @@ void loop() {
     }
   }
 
-  if (serialMode == USE_USB_SERIAL && millis() - communicationTimeout_timer > RX_COM_REINIT_TIMEOUT) {
-    serialMode = USE_UART_SERIAL;
-  }
+  // If we decide to go into USB Serial mode, the decision is final: do not listen back to the RF RX Teensy
+  // A reset is needed to go back in RF mode
+  //if (serialMode == USE_USB_SERIAL && millis() - communicationTimeout_timer > RX_COM_REINIT_TIMEOUT) {
+  //  serialMode = USE_UART_SERIAL;
+  //}
     
   
   if (serialMode == USE_USB_SERIAL) {
@@ -363,7 +361,13 @@ void loop() {
         Serial.send_now();
       }
     }
-  #endif  
+  #endif 
+
+  // Force an update of the LED array even if no new frame was received
+  if (millis() - lastFrameDisplayed_timer > MIN_REFRESH_PERIOD) {
+    FastLED.show();
+    lastFrameDisplayed_timer = millis();
+  }
 }
 
 
