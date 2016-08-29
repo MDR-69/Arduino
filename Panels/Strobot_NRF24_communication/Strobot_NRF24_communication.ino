@@ -37,7 +37,7 @@
 //#define DEBUG                  1
 
 /*************  Hardware Definitions *******************************/
-#define ID                     4        // Define the ID of the panel to communicate with, range is [0,4]
+#define ID                     3        // Define the ID of the panel to communicate with, range is [0,4]
 /*
 #define ID                     1
 #define ID                     2
@@ -45,8 +45,8 @@
 #define ID                     4
 */
 
-//#define ROLE_TX                0       // Define the role of this unit: TX for Strobot side, RX for panel side
-#define ROLE_RX                1
+#define ROLE_TX                0       // Define the role of this unit: TX for Strobot side, RX for panel side
+//#define ROLE_RX                1
 
 /*************  Hardware Definitions - General  *****************/
 #define NB_LEDS                128
@@ -65,7 +65,7 @@
 #define TX_COM_REINIT_TIMEOUT  20000   // If no frame is received after 20 seconds, consider the communication link to be down
 
 /*************  Hardware Definitions - RX side only  ************/
-#define NB_FRAMES_TX_PER_SEC   100      // Only used on the RX side: number of frames the receiver shall send to the LED microcontroller per second
+#define NB_FRAMES_TX_PER_SEC   80      // Only used on the RX side: number of frames the receiver shall send to the LED microcontroller per second
 #define RX_FRAME_TX_PERIOD_MS  int(1000/NB_FRAMES_TX_PER_SEC)
 #define HWSERIAL               Serial1 // UART serial used to forward data to the LED microcontroller
 #define HWSERIAL_BAUDRATE      6000000 // UART Serial baudrate - equal to 96MHz/16, absolute maximum available with Teensy 3.2
@@ -78,6 +78,10 @@
                                        // #define TX_BUFFER_SIZE     64 // number of outgoing bytes to buffer     ---> Change to 512
                                        // #define RX_BUFFER_SIZE     64 // number of incoming bytes to buffer     ---> Change to 512
                                        // With the buffers this big, the HWSERIAL.write call becomes non-blocking, and returns after 140 microsecs (instead of 580)
+#define SAME_COUNTER_PACKET_THR 400   // If the same packet is received N consecutive times, reset the system
+#define CPU_RESTART_ADDR        (uint32_t *)0xE000ED0C
+#define CPU_RESTART_VAL         0x5FA0004
+#define CPU_RESTART             (*CPU_RESTART_ADDR = CPU_RESTART_VAL);
                                        
 /*************  TPM2 Definitions *******************************/
 #define TPM2NET_HEADER_SIZE 4
@@ -115,6 +119,9 @@ const uint8_t predefined_frameSize_lsb = (uint8_t) ((NB_LEDS * BYTES_PER_PIXEL) 
 bool transmit_to_led_teensy = false;    // When the flag is set to true, send a consolidated frame to the next Teensy
 uint16_t serialBuffer_write_offset;     // What byte should we be writing next ?
 bool special_uniform_frame = false;     // Is the frame entirely of the same color ?
+uint32_t same_offset_cpt = 0;           // This counter is used to know how many consecutive packets referring to the same offset have been received (this does not concern the special header values)
+uint8_t  same_offset_val = 0;           // Seen during testing: in some rare cases, the antenna switches to a weird mode and transmits again and again the same frame
+                                        // Try to detect this case, and correct the problem by powering off the antenna, and resetting  the microcontroller
 
 /*************  Hardware RF Configuration  *********************/
 RF24 radio(7,8);                        // Set up nRF24L01 radio on SPI bus plus pins 7 & 8
@@ -125,16 +132,21 @@ const int ledPin = 13;                  // Teensy 3.0 has the LED on pin 13
 // Radio pipe addresses for the nodes to communicate.
 // The five first addresses are the panels', the following are the local emitters' addresses
 // These uint64_t addresses are used in the 40-bit address mode. To optimize the system, shave off two bytes and use 24 bit long addresses
-const uint64_t pipes[10] = { 0xABCDABCD71LL, 0x544d52687CLL, 
-                             0x544d526832LL, 0x544d52683CLL,
-                             0x544d526846LL, 0x544d526850LL,
-                             0x544d52685ALL, 0x544d526820LL, 
+const uint64_t pipes[10] = { 0xABCDABCD71LL, 0x544d52687CLL,          // Note: a restriction requires the 1-5 reading pipes to share the 
+                             0x544d526832LL, 0x544d52683CLL,          // Same top 32 bits, only to have the LSB change
+                             0x544d526846LL, 0x544d526850LL,          // As we do not need to listen on more than one pipe (point to point
+                             0x544d52685ALL, 0x544d526820LL,          // communication, free to set very specific addresses)
                              0x544d52686ELL, 0x544d52684BLL};
-const uint32_t short_pipes[10] = { 0xABCD71L, 0x544d7CL, 
-                                   0x544D32L, 0x544D3CL,
-                                   0x544D46L, 0x544D50L,
-                                   0x544D5AL, 0x544D20L, 
-                                   0x544D6EL, 0x544D4BL};
+const uint32_t short_pipes[10] = { 0xABCD71L, 0xABCD72L,
+                                   0x143EB6L, 0x143EB7L,
+                                   0xCA24F9L, 0xCA24FAL,
+                                   0x34830BL, 0x34830CL, 
+                                   0x744D6EL, 0x744D6FL};
+const uint8_t channels[5] = {6,              // It is important to use channels which are far from each other
+                             28,             // As the full bandwidth is used for each TX/RX pair, non-overlapping
+                             60,             // frequencies are critical for proper operation
+                             89,             // Note: do not use 96, as this is for the LED tubes
+                             119};
 
 uint8_t tx_data[NB_FRAMES][RF_FRAME_SIZE];   // Data buffers to send using the NRF24 antenna
 uint8_t temp_rx_data[RF_FRAME_SIZE];         // Temp buffer to receive data before checking the contents
@@ -160,7 +172,7 @@ void setup(void) {
   #endif
 
   #ifdef ROLE_RX
-    HWSERIAL.begin(HWSERIAL_BAUDRATE);                  // Initialize the second Serial link
+    HWSERIAL.begin(HWSERIAL_BAUDRATE);       // Initialize the second Serial link
     HWSERIAL.flush();
     HWSERIAL.setTimeout(20);
   #endif
@@ -168,12 +180,12 @@ void setup(void) {
   memset(packetBuffer, 0, MAX_PACKET_SIZE);  // Initialize the buffer to hold incoming packet data
 
   radio.begin();                             // Setup and configure rf radio
-  radio.setChannel(ID);                      // Set the RF channel to be equal to the ID (range [0,127])
+  radio.setChannel(channels[ID]);            // Set the RF channels of the different modules wide enough apart not to have interference (range [0,125])
   radio.setPALevel(RF24_PA_MAX);
   radio.setDataRate(RF24_1MBPS);
-  //radio.enableDynamicAck();                  // This MUST be called prior to attempting single write NOACK calls
+  //radio.enableDynamicAck();                // This MUST be called prior to attempting single write NOACK calls // No need to to that as ACK is disabled
   radio.setAutoAck(0);                       // Ensure autoACK is disabled - we don't need to know whether the packets are actually received
-  //radio.setRetries(2,15);                    // Optionally, increase the delay between retries & # of retries
+  //radio.setRetries(2,15);                  // Optionally, increase the delay between retries & # of retries // No need to to that as ACK is disabled
 
   #ifdef ENABLE_CRC
     radio.setCRCLength(RF24_CRC_8);          // Use 8-bit CRC for performance
@@ -296,7 +308,19 @@ void loop(void){
      
       // Check the contents of the received data and put it at the appropriate offset in the frame buffer
       process_rx_data();
-     
+
+      // Check if we're not getting into the weird RX mode, where the antenna only forwards the same packet again and again
+      if (same_offset_val == temp_rx_data[0] && temp_rx_data[0] < NB_LEDS) {
+        same_offset_cpt += 1;
+        if (same_offset_cpt >= SAME_COUNTER_PACKET_THR) {
+          reset_system();
+        }
+      }
+      else {
+        same_offset_cpt = 0;
+      }
+      same_offset_val = temp_rx_data[0];
+      
       #ifdef DEBUG
         Serial.print("RX: ");
         Serial.print(temp_rx_data[0], DEC);
@@ -581,3 +605,13 @@ void transmit_consolidated_frame_footer() {
   HWSERIAL.write(TPM2NET_FOOTER_IDENT);
   transmit_to_led_teensy = false;
 }
+
+void reset_system() {
+  radio.stopListening();
+  radio.powerDown();                        // Power down the radio
+  delay(100);                               // Wait 0.1 seconds
+  CPU_RESTART                               // And request a software restart from the Teensy
+  same_offset_cpt = 0;                      // Unreachable code, here just in case
+  delay(50);
+}
+

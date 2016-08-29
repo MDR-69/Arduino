@@ -11,7 +11,7 @@
 #include <DmxSimple.h>
 
 const int ledPin = 11;
-const int NUMBER_OF_CHANNELS = 8;
+const int NUMBER_OF_CHANNELS = 512;
 
 void setup() {
   // Initialize the Teensy LED, and light it up
@@ -29,7 +29,7 @@ void setup() {
   DmxSimple.maxChannel(NUMBER_OF_CHANNELS);
   
   // Start communicating with Processing
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println("SerialToDmx ready");
   Serial.println();
   Serial.println("Syntax to use with Processing sketch:");
