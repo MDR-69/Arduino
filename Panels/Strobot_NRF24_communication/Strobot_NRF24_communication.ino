@@ -37,7 +37,7 @@
 //#define DEBUG                  1
 
 /*************  Hardware Definitions *******************************/
-#define ID                     3        // Define the ID of the panel to communicate with, range is [0,4]
+#define ID                     0        // Define the ID of the panel to communicate with, range is [0,4]
 /*
 #define ID                     1
 #define ID                     2
@@ -45,8 +45,8 @@
 #define ID                     4
 */
 
-#define ROLE_TX                0       // Define the role of this unit: TX for Strobot side, RX for panel side
-//#define ROLE_RX                1
+//#define ROLE_TX                0       // Define the role of this unit: TX for Strobot side, RX for panel side
+#define ROLE_RX                1
 
 /*************  Hardware Definitions - General  *****************/
 #define NB_LEDS                128
@@ -142,7 +142,7 @@ const uint32_t short_pipes[10] = { 0xABCD71L, 0xABCD72L,
                                    0xCA24F9L, 0xCA24FAL,
                                    0x34830BL, 0x34830CL, 
                                    0x744D6EL, 0x744D6FL};
-const uint8_t channels[5] = {6,              // It is important to use channels which are far from each other
+const uint8_t channels[5] = {104,            // It is important to use channels which are far from each other
                              28,             // As the full bandwidth is used for each TX/RX pair, non-overlapping
                              60,             // frequencies are critical for proper operation
                              89,             // Note: do not use 96, as this is for the LED tubes
